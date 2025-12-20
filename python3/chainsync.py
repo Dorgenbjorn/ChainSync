@@ -53,14 +53,13 @@ class ChainSyncNode:
             self.task_func()
         finally:
             self.task_completed()
+        return None
 
     def task_completed(self):
         self.transition_state()
-        if not self.is_tail:
-            self.message_succ("COMPLETE")
-        else:
-            self.message_pred("COMPLETE")
+        if self.is_tail:
             self.exit()
+        return None
 
     def become_locally_ready(self):
         if self.local_ready:
@@ -68,10 +67,12 @@ class ChainSyncNode:
         self.local_ready = True
         print(f"[{self.node_id}] locally ready")
         self.transition_state()
+        return None
 
     def exit(self):
         print(f"[{self.node_id}] Setting exit flag...")
         self.exit_flag = True
+        return None
 
     def transition_state(self):
         start_state = self.state
@@ -97,9 +98,41 @@ class ChainSyncNode:
             self.execute_task()
         elif self.state == "START":
             self.state = "COMPLETE"
+            if not self.is_tail:
+                self.message_succ("COMPLETE")
+            else:
+                self.message_pred("COMPLETE")
             print(f"[{self.node_id}] State transition: {start_state} -> {self.state}")
         else: # do nothing
             print(f"[{self.node_id}] State transition: {start_state} -> {self.state}")
+        return None
+
+    def init_state(self, state):
+        if state == "SYNC":
+            pass
+        elif state == "READY":
+            self.pred_ready = True
+            self.local_ready = True
+            self.transition_state()
+        elif state == "WATCH":
+            self.pred_ready = True
+            self.local_ready = True
+            self.has_start_from_succ = True
+            self.transition_state()
+            self.transition_state()
+        elif state == "START":
+            self.pred_ready = True
+            self.local_ready = True
+            self.has_start_from_succ = True
+            self.pred_complete = True
+            self.transition_state()
+            self.transition_state()
+            self.transition_state()
+        elif state == "COMPLETE": # NOTE: starting in complete will not re-execute the task.
+            self.state = "START"
+            self.transition_state()
+        else: # Handle undefined states by starting them in "SYNC"
+            pass
         return None
 
     def handle_message(self, cmd: str, direction: str):
@@ -119,6 +152,7 @@ class ChainSyncNode:
             elif direction == "succ":
                 self.message_pred("COMPLETE")
                 self.exit()
+        return None
 
     def _reader(self, sock: socket.socket, direction: str):
         try:
@@ -134,6 +168,7 @@ class ChainSyncNode:
             print(f"[{self.node_id}] reader error on {direction}: {e}")
         finally:
             sock.close()
+        return None
 
     def _accept_pred(self):
         try:
@@ -143,6 +178,7 @@ class ChainSyncNode:
             threading.Thread(target=self._reader, args=(conn, "pred"), daemon=True).start()
         except Exception as e:
             print(f"[{self.node_id}] accept error: {e}")
+        return None
 
     def start(self):
         print(f"[{self.node_id}] starting (head={'yes' if self.is_head else 'no'}, tail={'yes' if self.is_tail else 'no'})")
@@ -168,6 +204,7 @@ class ChainSyncNode:
         while (not self.is_head and self.pred_socket is None) or (not self.is_tail and self.succ_socket is None):
             print(f"[{self.node_id}] waiting for connection...")
             time.sleep(0.5)
+        return None
 
 
 if __name__ == "__main__":
@@ -177,7 +214,7 @@ if __name__ == "__main__":
     parser.add_argument("--succ-host", default="localhost", help="Successor host (default: localhost)")
     parser.add_argument("--succ-port", type=int, help="Successor port (omit for tail)")
     parser.add_argument("--task-duration", type=float, default=None, help="Task duration in seconds (default: random 1-8s)")
-    #parser.add_argument("--start-in-complete", default=False, help="The node start in the 'COMPLETE' state. This option is useful if the server must restart.")
+    parser.add_argument("--initial-state", default="SYNC", type=str, help="Start the node in a specific state. This option is useful if the server must restart or you are recovering from a crash.")
 
     args = parser.parse_args()
 
@@ -185,12 +222,15 @@ if __name__ == "__main__":
 
     duration = args.task_duration if args.task_duration is not None else 5*(random.uniform(1, 8))
 
+    initial_state = args.initial_state
+
     def demo_task():
         print(f"[{args.id}] >>> EXECUTING local task (duration {duration:.2f}s) <<<")
         time.sleep(duration)
         print(f"[{args.id}] <<< local task finished >>>")
 
     node = ChainSyncNode(args.id, args.listen_port, succ_addr, demo_task)
+    node.init_state(initial_state)
     node.start()
 
     # Become ready at a random time to demonstrate correctness even with skewed readiness
