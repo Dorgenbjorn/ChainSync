@@ -1,3 +1,4 @@
+import ssl
 import sys
 import time
 import socket
@@ -7,11 +8,30 @@ import threading
 
 
 class ChainSyncNode:
-    def __init__(self, node_id: str, listen_port: int | None, succ_addr: tuple[str, int] | None, task_func):
+    def __init__(
+        self,
+        node_id: str,
+        listen_port: int | None,
+        succ_addr: tuple[str, int] | None,
+        task_func,
+        no_mtls,
+        no_localhost,
+        tls_key,
+        tls_cert,
+        tls_cert_trust,
+    ):
         self.node_id = node_id
         self.listen_port = listen_port
         self.succ_addr = succ_addr
         self.task_func = task_func
+        self.no_mtls = no_mtls
+        self.hostname = socket.gethostname() if no_localhost else "localhost"
+        self.tls_key = tls_key
+        self.tls_cert = tls_cert
+        self.tls_cert_trust = tls_cert_trust
+
+        self.server_context = None
+        self.client_context = None
 
         self.is_head = listen_port is None
         self.is_tail = succ_addr is None
@@ -29,7 +49,6 @@ class ChainSyncNode:
         self.has_complete_from_succ = False
         self.has_start_from_succ = False
 
-        self.lock = threading.Lock()
         self.exit_flag = False
 
     def message_pred(self, msg: str):
@@ -79,7 +98,9 @@ class ChainSyncNode:
             self.state = "READY"
             print(f"[{self.node_id}] State transition: {start_state} -> {self.state}")
             if self.is_tail:
-                self.has_start_from_succ = True # Tail initiates the backward START wave
+                self.has_start_from_succ = (
+                    True  # Tail initiates the backward START wave
+                )
                 self.transition_state()
             else:
                 self.message_succ("READY")
@@ -98,7 +119,7 @@ class ChainSyncNode:
         elif self.state == "START":
             self.state = "COMPLETE"
             print(f"[{self.node_id}] State transition: {start_state} -> {self.state}")
-        else: # do nothing
+        else:  # do nothing
             print(f"[{self.node_id}] State transition: {start_state} -> {self.state}")
         return None
 
@@ -139,23 +160,59 @@ class ChainSyncNode:
         try:
             conn, addr = self.server_socket.accept()
             print(f"[{self.node_id}] predecessor connected from {addr}")
-            self.pred_socket = conn
-            threading.Thread(target=self._reader, args=(conn, "pred"), daemon=True).start()
+            if self.no_mtls:
+                self.pred_socket = conn
+                threading.Thread(
+                    target=self._reader, args=(conn, "pred"), daemon=True
+                ).start()
+            else:
+                tls_sock = self.server_context.wrap_socket(conn, server_side=True)
+                self.pred_socket = tls_sock
+                threading.Thread(
+                    target=self._reader, args=(tls_sock, "pred"), daemon=True
+                ).start()
+
         except Exception as e:
             print(f"[{self.node_id}] accept error: {e}")
 
     def start(self):
-        print(f"[{self.node_id}] starting (head={'yes' if self.is_head else 'no'}, tail={'yes' if self.is_tail else 'no'})")
+        print(
+            f"[{self.node_id}] starting (head={'yes' if self.is_head else 'no'}, tail={'yes' if self.is_tail else 'no'})"
+        )
         if not self.is_head:
+            if self.no_mtls:
+                pass
+            else:
+                self.server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                self.server_context.load_cert_chain(
+                    certfile=self.tls_cert, keyfile=self.tls_key
+                )
+                self.server_context.load_verify_locations(self.tls_cert_trust)
+                self.server_context.verify_mode = ssl.CERT_REQUIRED
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.server_socket.bind(('', self.listen_port))
+            self.server_socket.bind(("", self.listen_port))
             self.server_socket.listen(1)
-            print(f"[{self.node_id}] listening on port {self.listen_port} for predecessor")
+            print(
+                f"[{self.node_id}] listening on port {self.listen_port} for predecessor"
+            )
             threading.Thread(target=self._accept_pred, daemon=True).start()
 
         if not self.is_tail:
             self.succ_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            if self.no_mtls:
+                pass
+            else:
+                self.client_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                self.client_context.load_cert_chain(
+                    certfile=self.tls_cert, keyfile=self.tls_key
+                )
+                self.client_context.load_verify_locations(self.tls_cert_trust)
+                self.client_context.verify_mode = ssl.CERT_REQUIRED
+                sock = self.succ_socket
+                self.succ_socket = self.client_context.wrap_socket(
+                    sock, server_hostname=self.hostname
+                )
             print(f"[{self.node_id}] connecting to successor {self.succ_addr} ...")
             while True:
                 try:
@@ -164,8 +221,12 @@ class ChainSyncNode:
                 except ConnectionRefusedError:
                     time.sleep(0.5)
             print(f"[{self.node_id}] connected to successor")
-            threading.Thread(target=self._reader, args=(self.succ_socket, "succ"), daemon=True).start()
-        while (not self.is_head and self.pred_socket is None) or (not self.is_tail and self.succ_socket is None):
+            threading.Thread(
+                target=self._reader, args=(self.succ_socket, "succ"), daemon=True
+            ).start()
+        while (not self.is_head and self.pred_socket is None) or (
+            not self.is_tail and self.succ_socket is None
+        ):
             print(f"[{self.node_id}] waiting for connection...")
             time.sleep(0.5)
 
@@ -173,24 +234,63 @@ class ChainSyncNode:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ChainSync reference implementation")
     parser.add_argument("--id", required=True, help="Node identifier (A, B, C, ...)")
-    parser.add_argument("--listen-port", type=int, help="Port to listen on for predecessor (omit for head)")
-    parser.add_argument("--succ-host", default="localhost", help="Successor host (default: localhost)")
-    parser.add_argument("--succ-port", type=int, help="Successor port (omit for tail)")
-    parser.add_argument("--task-duration", type=float, default=None, help="Task duration in seconds (default: random 1-8s)")
-    #parser.add_argument("--start-in-complete", default=False, help="The node start in the 'COMPLETE' state. This option is useful if the server must restart.")
+    parser.add_argument(
+        "--listen-port",
+        type=int,
+        help="Port to listen on for predecessor (omit for head).",
+    )
+    parser.add_argument(
+        "--succ-host", default="localhost", help="Successor host (default: localhost)."
+    )
+    parser.add_argument("--succ-port", type=int, help="Successor port (omit for tail).")
+    parser.add_argument(
+        "--task-duration",
+        type=float,
+        default=None,
+        help="Task duration in seconds (default: random 1-8s).",
+    )
+    parser.add_argument("--no-mtls", action="store_true", help="Disable mutual TLS.")
+    parser.add_argument(
+        "--no-localhost",
+        action="store_true",
+        help="Use the hostname and not 'localhost'.",
+    )
+    parser.add_argument(
+        "--tls-key", type=str, default=None, help="The node's private key."
+    )
+    parser.add_argument(
+        "--tls-cert", type=str, default=None, help="The node's certificate."
+    )
+    parser.add_argument(
+        "--tls-cert-trust", type=str, default=None, help="The root trust certificate."
+    )
 
     args = parser.parse_args()
 
     succ_addr = (args.succ_host, args.succ_port) if args.succ_port else None
 
-    duration = args.task_duration if args.task_duration is not None else 5*(random.uniform(1, 8))
+    duration = (
+        args.task_duration
+        if args.task_duration is not None
+        else (random.uniform(1, 20))
+    )
 
     def demo_task():
         print(f"[{args.id}] >>> EXECUTING local task (duration {duration:.2f}s) <<<")
         time.sleep(duration)
         print(f"[{args.id}] <<< local task finished >>>")
 
-    node = ChainSyncNode(args.id, args.listen_port, succ_addr, demo_task)
+    node = ChainSyncNode(
+        args.id,
+        args.listen_port,
+        succ_addr,
+        demo_task,
+        args.no_mtls,
+        args.no_localhost,
+        args.tls_key,
+        args.tls_cert,
+        args.tls_cert_trust,
+    )
     node.start()
 
     # Become ready at a random time to demonstrate correctness even with skewed readiness
