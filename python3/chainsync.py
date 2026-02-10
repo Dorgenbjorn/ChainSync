@@ -338,7 +338,7 @@ if __name__ == "__main__":
         "--tls-cert-trust", type=str, default=None, help="The root trust certificate."
     )
     parser.add_argument(
-        "--n-rounds", type=int, default=1, help="Number of concurrent rounds."
+        "--n-rounds", type=int, default=1, help="Number of concurrent rounds. Note that all nodes should have the same number of rounds. "
     )
     parser.add_argument(
         "--no-exit",
